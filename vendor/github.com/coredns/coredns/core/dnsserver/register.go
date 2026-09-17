@@ -30,7 +30,7 @@ func init() {
 	})
 }
 
-func newContext(i *caddy.Instance) caddy.Context {
+func newContext(_i *caddy.Instance) caddy.Context {
 	return &dnsContext{keysToConfigs: make(map[string]*Config)}
 }
 
@@ -52,7 +52,7 @@ var _ caddy.Context = &dnsContext{}
 // InspectServerBlocks make sure that everything checks out before
 // executing directives and otherwise prepares the directives to
 // be parsed and executed.
-func (h *dnsContext) InspectServerBlocks(sourceFile string, serverBlocks []caddyfile.ServerBlock) ([]caddyfile.ServerBlock, error) {
+func (h *dnsContext) InspectServerBlocks(_sourceFile string, serverBlocks []caddyfile.ServerBlock) ([]caddyfile.ServerBlock, error) {
 	// Normalize and check all the zone names and check for duplicates
 	for ib, s := range serverBlocks {
 		// Walk the s.Keys and expand any reverse address in their proper DNS in-addr zones. If the expansions leads for
@@ -88,6 +88,8 @@ func (h *dnsContext) InspectServerBlocks(sourceFile string, serverBlocks []caddy
 					port = transport.GRPCPort
 				case transport.HTTPS:
 					port = transport.HTTPSPort
+				case transport.HTTPS3:
+					port = transport.HTTPSPort
 				}
 			}
 
@@ -98,7 +100,7 @@ func (h *dnsContext) InspectServerBlocks(sourceFile string, serverBlocks []caddy
 				}
 			}
 			for i := range hosts {
-				zoneAddrs = append(zoneAddrs, zoneAddr{Zone: dns.Fqdn(hosts[i]), Port: port, Transport: trans})
+				zoneAddrs = append(zoneAddrs, zoneAddr{Zone: plugin.Name(hosts[i]).Normalize(), Port: port, Transport: trans})
 			}
 		}
 
@@ -134,69 +136,23 @@ func (h *dnsContext) InspectServerBlocks(sourceFile string, serverBlocks []caddy
 
 // MakeServers uses the newly-created siteConfigs to create and return a list of server instances.
 func (h *dnsContext) MakeServers() ([]caddy.Server, error) {
-	// Copy the Plugin, ListenHosts and Debug from first config in the block
-	// to all other config in the same block . Doing this results in zones
-	// sharing the same plugin instances and settings as other zones in
-	// the same block.
-	for _, c := range h.configs {
-		c.Plugin = c.firstConfigInBlock.Plugin
-		c.ListenHosts = c.firstConfigInBlock.ListenHosts
-		c.Debug = c.firstConfigInBlock.Debug
-		c.Stacktrace = c.firstConfigInBlock.Stacktrace
-
-		// Fork TLSConfig for each encrypted connection
-		c.TLSConfig = c.firstConfigInBlock.TLSConfig.Clone()
-		c.ReadTimeout = c.firstConfigInBlock.ReadTimeout
-		c.WriteTimeout = c.firstConfigInBlock.WriteTimeout
-		c.IdleTimeout = c.firstConfigInBlock.IdleTimeout
-		c.TsigSecret = c.firstConfigInBlock.TsigSecret
-	}
+	// Copy parameters from first config in the block to all other config in the same block
+	propagateConfigParams(h.configs)
 
 	// we must map (group) each config to a bind address
 	groups, err := groupConfigsByListenAddr(h.configs)
 	if err != nil {
 		return nil, err
 	}
+
 	// then we create a server for each group
 	var servers []caddy.Server
 	for addr, group := range groups {
-		// switch on addr
-		switch tr, _ := parse.Transport(addr); tr {
-		case transport.DNS:
-			s, err := NewServer(addr, group)
-			if err != nil {
-				return nil, err
-			}
-			servers = append(servers, s)
-
-		case transport.TLS:
-			s, err := NewServerTLS(addr, group)
-			if err != nil {
-				return nil, err
-			}
-			servers = append(servers, s)
-
-		case transport.QUIC:
-			s, err := NewServerQUIC(addr, group)
-			if err != nil {
-				return nil, err
-			}
-			servers = append(servers, s)
-
-		case transport.GRPC:
-			s, err := NewServergRPC(addr, group)
-			if err != nil {
-				return nil, err
-			}
-			servers = append(servers, s)
-
-		case transport.HTTPS:
-			s, err := NewServerHTTPS(addr, group)
-			if err != nil {
-				return nil, err
-			}
-			servers = append(servers, s)
+		serversForGroup, err := makeServersForGroup(addr, group)
+		if err != nil {
+			return nil, err
 		}
+		servers = append(servers, serversForGroup...)
 	}
 
 	// For each server config, check for View Filter plugins
@@ -263,8 +219,11 @@ func (c *Config) Handlers() []plugin.Handler {
 		return nil
 	}
 	hs := make([]plugin.Handler, 0, len(c.registry))
-	for k := range c.registry {
-		hs = append(hs, c.registry[k])
+	for _, k := range Directives {
+		registry := c.Handler(k)
+		if registry != nil {
+			hs = append(hs, registry)
+		}
 	}
 	return hs
 }
@@ -278,11 +237,13 @@ func (h *dnsContext) validateZonesAndListeningAddresses() error {
 			akey := zoneAddr{Transport: conf.Transport, Zone: conf.Zone, Address: h, Port: conf.Port}
 			var existZone, overlapZone *zoneAddr
 			if len(conf.FilterFuncs) > 0 {
-				// This config has filters. Check for overlap with other (unfiltered) configs.
-				existZone, overlapZone = checker.check(akey)
+				// This config has filters (e.g. view plugin). It is allowed to
+				// share a zone/port with an unfiltered server block, so we only
+				// check without registering and skip the "already defined" error.
+				_, overlapZone = checker.check(akey)
 			} else {
-				// This config has no filters. Check for overlap with other (unfiltered) configs,
-				// and register the zone to prevent subsequent zones from overlapping with it.
+				// This config has no filters. Check for overlap with other
+				// unfiltered configs and register the zone.
 				existZone, overlapZone = checker.registerAndCheck(akey)
 			}
 			if existZone != nil {
@@ -294,6 +255,36 @@ func (h *dnsContext) validateZonesAndListeningAddresses() error {
 		}
 	}
 	return nil
+}
+
+// propagateConfigParams copies the necessary parameters from first config in the block
+// to all other config in the same block. Doing this results in zones
+// sharing the same plugin instances and settings as other zones in
+// the same block.
+func propagateConfigParams(configs []*Config) {
+	for _, c := range configs {
+		c.Plugin = c.firstConfigInBlock.Plugin
+		c.ListenHosts = c.firstConfigInBlock.ListenHosts
+		c.Debug = c.firstConfigInBlock.Debug
+		c.Stacktrace = c.firstConfigInBlock.Stacktrace
+		c.NumSockets = c.firstConfigInBlock.NumSockets
+
+		// Fork TLSConfig for each encrypted connection
+		c.TLSConfig = c.firstConfigInBlock.TLSConfig.Clone()
+		c.ReadTimeout = c.firstConfigInBlock.ReadTimeout
+		c.WriteTimeout = c.firstConfigInBlock.WriteTimeout
+		c.IdleTimeout = c.firstConfigInBlock.IdleTimeout
+		c.MaxTCPQueries = c.firstConfigInBlock.MaxTCPQueries
+		c.TsigSecret = c.firstConfigInBlock.TsigSecret
+
+		// Propagate HTTPRequestValidateFunc so that custom path validators work in
+		// multi-transport blocks. Otherwise HTTPS 404s on non-"/dns-query" paths.
+		c.HTTPRequestValidateFunc = c.firstConfigInBlock.HTTPRequestValidateFunc
+
+		// Propagate UDPDecorateWriterFunc so a decorator configured once in a
+		// server block applies to the block's UDP listener(s).
+		c.UDPDecorateWriterFunc = c.firstConfigInBlock.UDPDecorateWriterFunc
+	}
 }
 
 // groupConfigsByListenAddr groups site configs by their listen
@@ -317,6 +308,70 @@ func groupConfigsByListenAddr(configs []*Config) (map[string][]*Config, error) {
 	return groups, nil
 }
 
+// makeServersForGroup creates servers for a specific transport and group.
+// It creates as many servers as specified in the NumSockets configuration.
+// If the NumSockets param is not specified, one server is created by default.
+func makeServersForGroup(addr string, group []*Config) ([]caddy.Server, error) {
+	// that is impossible, but better to check
+	if len(group) == 0 {
+		return nil, fmt.Errorf("no configs for group defined")
+	}
+	// create one server by default if no NumSockets specified
+	numSockets := 1
+	if group[0].NumSockets > 0 {
+		numSockets = group[0].NumSockets
+	}
+
+	var servers []caddy.Server
+	for range numSockets {
+		// switch on addr
+		switch tr, _ := parse.Transport(addr); tr {
+		case transport.DNS:
+			s, err := NewServer(addr, group)
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, s)
+
+		case transport.TLS:
+			s, err := NewServerTLS(addr, group)
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, s)
+
+		case transport.QUIC:
+			s, err := NewServerQUIC(addr, group)
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, s)
+
+		case transport.GRPC:
+			s, err := NewServergRPC(addr, group)
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, s)
+
+		case transport.HTTPS:
+			s, err := NewServerHTTPS(addr, group)
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, s)
+
+		case transport.HTTPS3:
+			s, err := NewServerHTTPS3(addr, group)
+			if err != nil {
+				return nil, err
+			}
+			servers = append(servers, s)
+		}
+	}
+	return servers, nil
+}
+
 // DefaultPort is the default port.
 const DefaultPort = transport.Port
 
@@ -329,5 +384,3 @@ var (
 	// GracefulTimeout is the maximum duration of a graceful shutdown.
 	GracefulTimeout time.Duration
 )
-
-var _ caddy.GracefulServer = new(Server)
